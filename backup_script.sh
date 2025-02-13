@@ -247,111 +247,171 @@ install_fuse() {
     fi
 }
 
-### 初始化检查函数 ###
-init_check() {
-    # 检查是否为 root 用户
-    if [[ $EUID -ne 0 ]]; then
-        echo "错误: 此脚本需要 root 权限运行"
-        exit 1
+### 检查系统类型 ###
+check_system_type() {
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        OS=$ID
+        VERSION=$VERSION_ID
+    elif [ -f /etc/debian_version ]; then
+        OS=debian
+    elif [ -f /etc/redhat-release ]; then
+        OS=rhel
+    else
+        OS=$(uname -s)
     fi
-
-    # 定义配置文件路径（确保在使用前已定义）
-    CONFIG_FILE="${CONFIG_FILE:-/etc/backup_script/config}"
-    LOG_DIR="${LOG_DIR:-/var/log/backup_script}"
-
-    # 检查必要的命令
-    local required_commands=("rclone" "rsync" "curl" "jq")
-    for cmd in "${required_commands[@]}"; do
-        if ! command -v "$cmd" >/dev/null 2>&1; then
-            echo "错误: 未找到命令 '$cmd'"
-            echo "请安装所需的包。"
-            exit 1
-        fi
-    done
-
-    # 检查并安装 FUSE
-    if ! command -v fusermount3 >/dev/null 2>&1 && ! command -v fusermount >/dev/null 2>&1; then
-        install_fuse || {
-            print_status "无法安装 FUSE，请手动安装 fuse 或 fuse3 包" "error"
-            exit 1
-        }
-    fi
-
-    # 检查配置文件目录
-    if [ ! -d "$(dirname "$CONFIG_FILE")" ]; then
-        mkdir -p "$(dirname "$CONFIG_FILE")"
-    fi
-
-    # 检查配置文件
-    if [ ! -f "$CONFIG_FILE" ]; then
-        print_status "配置文件不存在，将进入配置向导" "info"
-        setup_wizard
-    fi
-
-    # 检查日志目录
-    if [ ! -d "$LOG_DIR" ]; then
-        mkdir -p "$LOG_DIR"
-    fi
-
-    # 初始化界面
-    init_ui
+    echo "$OS"
 }
 
 ### 安装依赖 ###
 install_dependencies() {
+    local OS=$(check_system_type)
     local packages=()
     local install_cmd=""
     local update_cmd=""
+    local has_error=0
+
+    print_status "检测到系统类型: $OS" "info"
 
     # 根据系统类型设置包管理器命令
     case "${OS,,}" in
-    debian | ubuntu)
-        install_cmd="apt-get install -y"
-        update_cmd="apt-get update"
-        packages=(rclone fuse rsync cron curl wget sudo)
-        ;;
-    centos | rhel | fedora)
-        install_cmd="yum install -y"
-        update_cmd="yum check-update"
-        packages=(rclone fuse rsync cronie curl wget sudo)
-        ;;
-    suse)
-        install_cmd="zypper install -y"
-        update_cmd="zypper refresh"
-        packages=(rclone fuse rsync cron curl wget sudo)
-        ;;
-    alpine)
-        install_cmd="apk add"
-        update_cmd="apk update"
-        packages=(rclone fuse rsync dcron curl wget sudo)
-        ;;
-    *)
-        print_status "未知的系统类型: $OS" "error"
-        print_status "请手动安装以下包: rclone, fuse, rsync, cron, curl, wget, sudo" "info"
-        return 1
-        ;;
+        debian|ubuntu)
+            install_cmd="apt-get install -y"
+            update_cmd="apt-get update"
+            packages=(rclone fuse3 fuse rsync cron curl wget sudo jq)
+            ;;
+        centos|rhel|fedora)
+            install_cmd="yum install -y"
+            update_cmd="yum check-update"
+            packages=(fuse3 fuse rsync cronie curl wget sudo jq)
+            ;;
+        suse|opensuse*)
+            install_cmd="zypper install -y"
+            update_cmd="zypper refresh"
+            packages=(fuse3 fuse rsync cron curl wget sudo jq)
+            ;;
+        alpine)
+            install_cmd="apk add"
+            update_cmd="apk update"
+            packages=(fuse3 fuse rsync dcron curl wget sudo jq)
+            ;;
+        *)
+            print_status "未知的系统类型: $OS" "error"
+            print_status "请手动安装以下包: rclone, fuse3/fuse, rsync, cron, curl, wget, sudo, jq" "info"
+            return 1
+            ;;
     esac
 
     # 更新包管理器缓存
     print_status "更新包管理器缓存..." "info"
-    $update_cmd >/dev/null 2>&1
+    if ! $update_cmd >/dev/null 2>&1; then
+        print_status "更新包管理器缓存失败，继续尝试安装依赖..." "warning"
+    fi
 
     # 检查并安装缺失的包
     local missing_packages=()
     for pkg in "${packages[@]}"; do
-        if ! dpkg -l | grep -q "^ii.*$pkg" 2>/dev/null &&
-            ! rpm -q "$pkg" >/dev/null 2>&1 &&
-            ! apk info -e "$pkg" >/dev/null 2>&1; then
+        if ! command -v "$pkg" >/dev/null 2>&1 && \
+           ! dpkg -l | grep -q "^ii.*$pkg" 2>/dev/null && \
+           ! rpm -q "$pkg" >/dev/null 2>&1 && \
+           ! apk info -e "$pkg" >/dev/null 2>&1; then
             missing_packages+=("$pkg")
         fi
     done
 
     # 特殊检查 rclone（可能是通过其他方式安装的）
     if ! command -v rclone >/dev/null 2>&1; then
-        print_status "未检测到 rclone，尝试安装..." "info"
-        if ! curl https://rclone.org/install.sh | sudo bash; then
-            print_status "rclone 安装失败" "error"
-            return 1
+        print_status "未检测到 rclone，正在安装..." "info"
+        case "${OS,,}" in
+            debian|ubuntu|centos|rhel|fedora|suse|opensuse*)
+                curl https://rclone.org/install.sh | sudo bash || {
+                    print_status "rclone 安装失败" "error"
+                    has_error=1
+                }
+                ;;
+            alpine)
+                if ! apk add rclone; then
+                    print_status "rclone 安装失败" "error"
+                    has_error=1
+                fi
+                ;;
+        esac
+    fi
+
+    # 特殊处理 FUSE 相关包
+    if ! command -v fusermount >/dev/null 2>&1 && ! command -v fusermount3 >/dev/null 2>&1; then
+        print_status "未检测到 fusermount，正在安装 FUSE 支持..." "info"
+        case "${OS,,}" in
+            debian|ubuntu)
+                # 先尝试安装 fuse3
+                if ! $install_cmd fuse3 >/dev/null 2>&1; then
+                    print_status "安装 fuse3 失败，尝试安装 fuse..." "warning"
+                    if ! $install_cmd fuse >/dev/null 2>&1; then
+                        print_status "安装 fuse 失败，尝试安装完整依赖..." "warning"
+                    fi
+                fi
+                
+                # 安装所有可能需要的包
+                $install_cmd fuse3 fuse libfuse3-3 libfuse2 fuse-utils fuse3-utils >/dev/null 2>&1 || true
+                
+                # 如果系统是 Debian 11 或更高版本，确保安装 fuse3-utils
+                if [ -f /etc/debian_version ]; then
+                    debian_version=$(cat /etc/debian_version | cut -d. -f1)
+                    if [ "$debian_version" -ge 11 ] 2>/dev/null; then
+                        $install_cmd fuse3-utils >/dev/null 2>&1 || true
+                    fi
+                fi
+                
+                # 重新加载 udev 规则
+                if command -v udevadm >/dev/null 2>&1; then
+                    udevadm control --reload-rules >/dev/null 2>&1 || true
+                    udevadm trigger >/dev/null 2>&1 || true
+                fi
+                
+                # 确保 fuse 内核模块已加载
+                modprobe fuse >/dev/null 2>&1 || true
+                
+                # 确保 fuse 组存在并且当前用户在其中
+                if ! getent group fuse >/dev/null; then
+                    groupadd fuse >/dev/null 2>&1 || true
+                fi
+                usermod -a -G fuse "$(whoami)" >/dev/null 2>&1 || true
+                
+                # 确保 fuse 设备具有正确的权限
+                if [ -c /dev/fuse ]; then
+                    chmod 666 /dev/fuse >/dev/null 2>&1 || true
+                fi
+                ;;
+            centos|rhel|fedora)
+                $install_cmd fuse3 fuse fuse3-libs fuse-libs >/dev/null 2>&1
+                ;;
+            suse|opensuse*)
+                $install_cmd fuse3 fuse libfuse3-3 libfuse2 >/dev/null 2>&1
+                ;;
+            alpine)
+                $install_cmd fuse3 fuse >/dev/null 2>&1
+                ;;
+        esac
+        
+        # 重新检查 fusermount
+        if ! command -v fusermount >/dev/null 2>&1 && ! command -v fusermount3 >/dev/null 2>&1; then
+            print_status "FUSE 安装失败，尝试最后的修复..." "warning"
+            # 最后的尝试：重新安装完整的 FUSE 包
+            case "${OS,,}" in
+                debian|ubuntu)
+                    $install_cmd --reinstall fuse3 fuse fuse3-utils fuse-utils >/dev/null 2>&1
+                    ;;
+            esac
+            
+            # 再次检查
+            if ! command -v fusermount >/dev/null 2>&1 && ! command -v fusermount3 >/dev/null 2>&1; then
+                print_status "FUSE 安装失败" "error"
+                print_status "请尝试手动执行: apt install --reinstall fuse3 fuse fuse3-utils fuse-utils" "info"
+                print_status "然后检查 /dev/fuse 权限和 fuse 内核模块是否已加载" "info"
+                has_error=1
+            fi
+        else
+            print_status "FUSE 安装成功" "success"
         fi
     fi
 
@@ -365,6 +425,7 @@ install_dependencies() {
                     print_status "$pkg 安装成功" "success"
                 else
                     print_status "$pkg 安装失败" "error"
+                    has_error=1
                 fi
             done
         else
@@ -374,22 +435,46 @@ install_dependencies() {
         print_status "所有依赖已安装" "success"
     fi
 
+    # 确保服务已启动（针对不同系统）
+    case "${OS,,}" in
+        debian|ubuntu)
+            systemctl enable --now cron >/dev/null 2>&1 || true
+            ;;
+        centos|rhel|fedora)
+            systemctl enable --now crond >/dev/null 2>&1 || true
+            ;;
+        suse|opensuse*)
+            systemctl enable --now cron >/dev/null 2>&1 || true
+            ;;
+        alpine)
+            rc-update add dcron default >/dev/null 2>&1 || true
+            rc-service dcron start >/dev/null 2>&1 || true
+            ;;
+    esac
+
     # 验证必要的命令是否可用
-    local required_commands=(rclone rsync fusermount mount)
+    local required_commands=(rclone rsync mount)
     local missing_commands=()
 
     for cmd in "${required_commands[@]}"; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
             missing_commands+=("$cmd")
+            has_error=1
         fi
     done
+
+    # 特殊检查 fusermount 命令（支持 fusermount 和 fusermount3）
+    if ! command -v fusermount >/dev/null 2>&1 && ! command -v fusermount3 >/dev/null 2>&1; then
+        missing_commands+=("fusermount/fusermount3")
+        has_error=1
+    fi
 
     if [ ${#missing_commands[@]} -ne 0 ]; then
         print_status "警告：以下命令未找到: ${missing_commands[*]}" "error"
         return 1
     fi
 
-    return 0
+    return $has_error
 }
 
 ### 基础函数 ###
@@ -415,8 +500,44 @@ ulimit -v 1048576 # 虚拟内存限制（KB）
 ### 初始化配置 ###
 TEMP_CONFIG="/tmp/backup_temp.conf"
 
-# 只在缺少依赖时安装
-check_dependencies || install_dependencies
+### 初始化检查函数 ###
+init_check() {
+    # 检查是否为 root 用户
+    if [[ $EUID -ne 0 ]]; then
+        echo "错误: 此脚本需要 root 权限运行"
+        exit 1
+    fi
+
+    # 定义配置文件路径（确保在使用前已定义）
+    CONFIG_FILE="${CONFIG_FILE:-/etc/backup_script/config}"
+    LOG_DIR="${LOG_DIR:-/var/log/backup_script}"
+
+    # 检查并安装依赖
+    print_status "检查系统依赖..." "info"
+    if ! install_dependencies; then
+        print_status "依赖安装失败，请检查错误信息并手动安装缺失的包" "error"
+        exit 1
+    fi
+
+    # 检查配置文件目录
+    if [ ! -d "$(dirname "$CONFIG_FILE")" ]; then
+        mkdir -p "$(dirname "$CONFIG_FILE")"
+    fi
+
+    # 检查配置文件
+    if [ ! -f "$CONFIG_FILE" ]; then
+        print_status "配置文件不存在，将进入配置向导" "info"
+        setup_wizard
+    fi
+
+    # 检查日志目录
+    if [ ! -d "$LOG_DIR" ]; then
+        mkdir -p "$LOG_DIR"
+    fi
+
+    # 初始化界面
+    init_ui
+}
 
 ### 初始化配置 ###
 init_config() {
@@ -1763,13 +1884,6 @@ backup_main() {
     exit $overall_status
 }
 
-# 根据参数决定执行模式
-if [ "$1" = "main" ]; then
-    backup_main
-else
-    interactive_menu
-fi
-
 ### 日志配置管理 ###
 modify_log_config() {
     while true; do
@@ -2131,3 +2245,20 @@ perform_backup() {
 
     return $overall_status
 }
+
+### 主程序入口 ###
+main() {
+    # 根据参数决定执行模式
+    if [ "$1" = "main" ]; then
+        # 初始化检查
+        init_check || exit 1
+        backup_main
+    else
+        # 初始化检查
+        init_check || exit 1
+        interactive_menu
+    fi
+}
+
+# 执行主程序
+main "$@"
